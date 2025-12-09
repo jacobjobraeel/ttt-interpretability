@@ -49,6 +49,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     save_milestone_freq=0,
     dataset_path="",
     dataset_name="the_pile",
+    dataset_config_name=None,
     tokenizer_name="nousresearch/Llama-2-7b-hf",
     seq_length=2048,
     global_batch_size=1,
