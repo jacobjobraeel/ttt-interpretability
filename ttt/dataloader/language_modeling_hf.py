@@ -37,6 +37,7 @@ class LMDataModule:
         pin_memory=False,
         drop_last=False,
         fault_tolerant=False,
+        generate_repetitive_data=False,
     ):
         super().__init__()
         self.dataset_name = dataset_name
@@ -58,8 +59,12 @@ class LMDataModule:
         if fault_tolerant:
             assert self.shuffle
         self.fault_tolerant = fault_tolerant
+        self.generate_repetitive_data = generate_repetitive_data
 
     def prepare_data(self):
+        if self.generate_repetitive_data:
+            return
+
         if self.cache_dir is None:
             # Just download the dataset
             load_dataset(self.dataset_name, self.dataset_config_name)
@@ -82,9 +87,25 @@ class LMDataModule:
     def process_dataset(self):
         cache_dir = None if self.cache_dir is None else self.cache_dir / self._cache_dir_name
 
-        if cache_dir is not None:
+        if cache_dir is not None and not self.generate_repetitive_data:
             if cache_dir.is_dir():
                 return self._load_from_cache(cache_dir)
+
+        if self.generate_repetitive_data:
+            tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, use_fast=True)
+            master_print("Generating repetitive synthetic data for Drift Test...")
+            text = "The quick brown fox jumps over the lazy dog. " * 100
+            ids = tokenizer(text)["input_ids"]
+            # Repeat to ~100k tokens (sufficient for drift testing)
+            repeat_count = 100_000 // len(ids) + 1
+            dtype = np.uint16 if tokenizer.vocab_size < 64 * 1024 else np.int32
+            full_ids = np.array(ids * repeat_count, dtype=dtype)[:100000]
+            concat_ids = {
+                "train": full_ids,
+                "validation": full_ids,
+                "test": full_ids,
+            }
+            return concat_ids, tokenizer
 
         if self.raw_json_path is not None:
             raw_datasets = load_dataset("json", data_files=self.raw_json_path)

@@ -218,6 +218,7 @@ class ModelConfig(PretrainedConfig):
         scan_mlp_chunk_size=1024,
         fcm_min_ratio=0.0,
         fcm_max_ratio=0.0,
+        frozen_layers=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -243,6 +244,7 @@ class ModelConfig(PretrainedConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
+        self.frozen_layers = frozen_layers if frozen_layers is not None else []
         super().__init__(
             bos_token_id=bos_token_id, eos_token_id=eos_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs
         )
@@ -664,8 +666,16 @@ class Block(nn.Module):
                 prevent_cse=True,
             )
 
+        kwargs = {}
+        if self.config.seq_modeling_block.startswith("ttt"):
+            is_frozen = False
+            # self.name is the layer index as string
+            if int(self.name) in self.config.frozen_layers:
+                is_frozen = True
+            kwargs["is_frozen"] = is_frozen
+
         self.seq_modeling_block = seq_modeling_block(
-            self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision
+            self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision, **kwargs
         )
         self.feed_forward = mlp_module(
             self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision

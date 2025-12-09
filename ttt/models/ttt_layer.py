@@ -118,6 +118,7 @@ class TTTBase(nn.Module):
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
+    is_frozen: bool = False
 
     def setup(self):
         self.width = self.config.hidden_size
@@ -316,22 +317,23 @@ class TTTBase(nn.Module):
                 _, outputs = scan_remat_every_n_iterations_scan(
                     compute_mini_batch, self.config.remat_mini_batch_group_size, ttt_params_init, inputs
                 )
-                Z, ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1 = outputs
-                return (Z.reshape(-1, self.head_dim), ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1)
+                Z, ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1, grad_norm_t = outputs
+                return (Z.reshape(-1, self.head_dim), ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1, grad_norm_t)
 
             outputs = parallelize_over_heads(XQ, XK, XV, eta, self.ttt_params, self.ttt_norm_params)
             return outputs
 
         outputs = update_embed(XQ, XK, XV, eta)
-        Z, ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1 = outputs
+        Z, ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1, grad_norm_t = outputs
         Z = Z.transpose(0, 2, 1, 3).reshape(B, N, -1)
 
         if self.config.output_ttt_stats:
             ttt_loss_mse_init = ttt_loss_mse_init.mean(axis=(0, 1))
             ttt_loss_mse_step_0 = ttt_loss_mse_step_0.mean(axis=(0, 1))
             ttt_loss_mse_step_1 = ttt_loss_mse_step_1.mean(axis=(0, 1))
+            grad_norm_t = grad_norm_t.mean(axis=(0, 1))
 
-        return Z, (ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1)
+        return Z, (ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1, grad_norm_t)
 
     def __call__(
         self,
@@ -387,6 +389,9 @@ class TTTLinearBase(TTTBase):
         grad_l_wrt_ttt_norm_out = ttt_norm_out - ssl_target
         grad_l_wrt_Z1 = ttt_norm_vjp(grad_l_wrt_ttt_norm_out)[0]
 
+        if self.is_frozen:
+            grad_l_wrt_Z1 = jnp.zeros_like(grad_l_wrt_Z1)
+
         # Calculate TTT loss using W_init of the current mini-batch
         if self.config.output_ttt_stats:
             ttt_loss_mse_step_0 = (grad_l_wrt_ttt_norm_out[-1] ** 2).mean()
@@ -421,11 +426,20 @@ class TTTLinearBase(TTTBase):
         else:
             ttt_loss_mse_step_1 = None
 
+        # Calculate Gradient Norms (Plasticity)
+        # grad_l_wrt_Z1: (B_mini, H, D)
+        delta_norm = jnp.linalg.norm(grad_l_wrt_Z1, axis=-1)  # (B_mini, H)
+        x_norm = jnp.linalg.norm(X1, axis=-1)  # (B_mini, H)
+        eta_mag = eta_mini_batch.squeeze(-1)  # (B_mini, H)
+
+        # ||Delta theta|| = eta * ||delta|| * sqrt(||x||^2 + 1)
+        grad_norm_t = eta_mag * delta_norm * jnp.sqrt(jnp.square(x_norm) + 1.0)  # (B_mini,)
+
         ttt_params_mini_batch_new = (W1_bar_last, b1_bar_last)
 
         return (
             ttt_params_mini_batch_new,
-            (output_mini_batch, ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1),
+            (output_mini_batch, ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1, grad_norm_t),
         )
 
 
@@ -551,6 +565,10 @@ class TTTMLPBase(TTTBase):
         grad_l_wrt_Z2 = ttt_norm_vjp(grad_l_wrt_ttt_norm_out)[0]
         grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(1, 0) * diff_gelu(Z1)
 
+        if self.is_frozen:
+            grad_l_wrt_Z2 = jnp.zeros_like(grad_l_wrt_Z2)
+            grad_l_wrt_Z1 = jnp.zeros_like(grad_l_wrt_Z1)
+
         if self.config.output_ttt_stats:
             ttt_loss_mse_step_0 = (grad_l_wrt_ttt_norm_out[-1] ** 2).mean()
         else:
@@ -592,11 +610,27 @@ class TTTMLPBase(TTTBase):
         else:
             ttt_loss_mse_step_1 = None
 
+        # Calculate Gradient Norms (Plasticity)
+        eta_mag = eta_mini_batch.squeeze(-1)  # (B_mini, H)
+
+        # Layer 1
+        delta_norm_1 = jnp.linalg.norm(grad_l_wrt_Z1, axis=-1)
+        x_norm_1 = jnp.linalg.norm(X1, axis=-1)
+        grad_norm_1 = eta_mag * delta_norm_1 * jnp.sqrt(jnp.square(x_norm_1) + 1.0)
+
+        # Layer 2
+        delta_norm_2 = jnp.linalg.norm(grad_l_wrt_Z2, axis=-1)
+        x_norm_2 = jnp.linalg.norm(X2, axis=-1)
+        grad_norm_2 = eta_mag * delta_norm_2 * jnp.sqrt(jnp.square(x_norm_2) + 1.0)
+
+        # Total
+        grad_norm_t = jnp.sqrt(jnp.square(grad_norm_1) + jnp.square(grad_norm_2)) # (B_mini,)
+
         ttt_params_mini_batch_new = (W1_bar_last, W2_bar_last, b1_bar_last, b2_bar_last)
 
         return (
             ttt_params_mini_batch_new,
-            (output_mini_batch, ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1),
+            (output_mini_batch, ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1, grad_norm_t),
         )
 
 

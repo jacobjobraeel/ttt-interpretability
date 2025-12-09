@@ -415,6 +415,7 @@ def log_ttt_stats(layer, ttt_stats_layer, x_axis, step):
     ttt_loss_mse_init = ttt_stats_layer[1]
     ttt_loss_mse_step_0 = ttt_stats_layer[2]
     ttt_loss_mse_step_1 = ttt_stats_layer[3]
+    grad_norm_t = ttt_stats_layer[4]
 
     fig, ax = plt.subplots()
     ax.plot(x_axis, ssl_tgt_last_in_mini_batch_from_mean_mse, label="$\\|E[Y_{ssl}]-Y_{ssl}\\|^2$", color="green")
@@ -426,4 +427,14 @@ def log_ttt_stats(layer, ttt_stats_layer, x_axis, step):
     ax.set_title(f"Layer {layer + 1}")
     ax.legend()
     log_plot(fig, f"Layer {layer + 1} TTT Loss", step)
+    plt.close()
+
+    # New Plot for Gradient Norm
+    fig_grad, ax_grad = plt.subplots()
+    ax_grad.plot(x_axis, grad_norm_t, label="Gradient Norm", color="purple")
+    ax_grad.set_ylabel("L2 Norm")
+    ax_grad.set_xlabel("Position in Sequence")
+    ax_grad.set_title(f"Layer {layer + 1} Plasticity")
+    ax_grad.legend()
+    log_plot(fig_grad, f"Layer {layer + 1} Gradient Norm", step)
     plt.close()

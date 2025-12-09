@@ -63,6 +63,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     resume_step="",
     jax_distributed=JaxDistributedConfig.get_default_config(),
     is_rollback_reshuffle=False,
+    generate_repetitive_data=False,
 )
 
 
@@ -157,12 +158,18 @@ def make_eval_step_fn(model, model_config):
     def eval_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(("dp", "fsdp")))
-        logits = model.apply(
-            train_state.params, batch["input_tokens"], deterministic=True, rngs=rng_generator(model_config.rng_keys())
-        ).logits
+        outputs = model.apply(
+            train_state.params,
+            batch["input_tokens"],
+            deterministic=True,
+            output_ttt_stats=model_config.seq_modeling_block.startswith("ttt"),
+            rngs=rng_generator(model_config.rng_keys()),
+        )
+        logits = outputs.logits
+        ttt_stats = outputs.ttt_stats
         loss, accuracy = cross_entropy_loss_and_accuracy(logits, batch["target_tokens"], batch["loss_masks"])
         metrics = dict(eval_loss=loss, eval_accuracy=accuracy)
-        return rng_generator(), metrics
+        return rng_generator(), metrics, ttt_stats
 
     return eval_step
 
@@ -349,6 +356,7 @@ def main(argv):
         shuffle=True,
         fault_tolerant=True,
         drop_last=True,
+        generate_repetitive_data=FLAGS.generate_repetitive_data,
     )
     data_module.prepare_data()
     data_module.setup()
@@ -419,18 +427,33 @@ def main(argv):
             sharded_eval_step = pjit(
                 eval_step,
                 in_shardings=(train_state_partition, PS(), PS()),
-                out_shardings=(PS(), PS()),
+                out_shardings=(PS(), PS(), PS()),  # Added extra PS for ttt_stats
                 donate_argnums=(1,),
             )
 
             val_loader = data_module.val_dataloader()
             eval_metric_list = []
-
+            
+            step = 0
             for eval_batch in tqdm(val_loader, disable=not master_process):
+                step += 1
                 for k in eval_batch.keys():
                     eval_batch[k] = eval_batch[k].numpy()
-                sharded_rng, eval_metrics = sharded_eval_step(train_state, sharded_rng, eval_batch)
+                sharded_rng, eval_metrics, ttt_stats = sharded_eval_step(train_state, sharded_rng, eval_batch)
                 eval_metric_list.append(eval_metrics)
+                
+                # Log TTT stats (Heatmap) during Eval
+                output_ttt_stats = (
+                    FLAGS.save_milestone_freq > 0
+                    and step % FLAGS.save_milestone_freq == 0
+                    and model_config.seq_modeling_block != "self_attention"
+                )
+                if master_process and output_ttt_stats:
+                    for layer in range(len(ttt_stats)):
+                        ttt_stats_layer = process_allgather(ttt_stats[layer])
+                        n_mini_batch = len(ttt_stats_layer[0])
+                        x_axis = [model_config.mini_batch_size * i for i in range(1, n_mini_batch + 1)]
+                        log_ttt_stats(layer, ttt_stats_layer, x_axis, step)
 
             val_loss_avg = average_metrics(process_allgather(eval_metric_list))["eval_loss"].item()
             if master_process:
