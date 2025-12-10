@@ -1,6 +1,7 @@
 import mlxu
 import wandb
 import os.path as osp
+import time
 
 from tqdm import tqdm
 from copy import deepcopy
@@ -17,6 +18,7 @@ from flax.traverse_util import flatten_dict
 
 from ttt.infra.optimizers import OptimizerFactory
 from ttt.dataloader.language_modeling_hf import LMDataModule
+from ttt.dataloader.quick_loader import QuickTestDataModule
 from ttt.infra.checkpoint import StreamingCheckpointer
 from ttt.models.model import ModelConfig, CausalLM
 from ttt.infra.jax_utils import (
@@ -33,8 +35,7 @@ from ttt.infra.jax_utils import (
     make_shard_and_gather_fns,
     with_sharding_constraint,
     master_print,
-    log_ttt_stats,
-    log_gradient_norm_heatmap,
+    log_comprehensive_stats,
 )
 
 
@@ -345,21 +346,40 @@ def main(argv):
     is_rollback_reshuffle = FLAGS.is_rollback_reshuffle
 
     # Create dataloader
-    data_module = LMDataModule(
-        dataset_name=FLAGS.dataset_name,
-        dataset_config_name=FLAGS.dataset_config_name,
-        tokenizer_name=FLAGS.tokenizer_name,
-        cache_dir=FLAGS.dataset_path,
-        max_length=seq_length,
-        add_eos=True,
-        batch_size=global_batch_size,
-        batch_size_eval=global_batch_size,
-        loader_workers=FLAGS.loader_workers,
-        shuffle=True,
-        fault_tolerant=True,
-        drop_last=True,
-        generate_repetitive_data=FLAGS.generate_repetitive_data,
-    )
+    if FLAGS.dataset_path == "quick_test":
+        master_print("Initializing Quick Test Data Module (Stream-to-RAM)...")
+        data_module = QuickTestDataModule(
+            dataset_name=FLAGS.dataset_name,
+            dataset_config_name=FLAGS.dataset_config_name,
+            tokenizer_name=FLAGS.tokenizer_name,
+            cache_dir=None, # Not used for streaming
+            max_length=seq_length,
+            add_eos=True,
+            batch_size=global_batch_size,
+            batch_size_eval=global_batch_size,
+            loader_workers=FLAGS.loader_workers,
+            shuffle=True,
+            fault_tolerant=True,
+            drop_last=True,
+            generate_repetitive_data=FLAGS.generate_repetitive_data,
+        )
+    else:
+        data_module = LMDataModule(
+            dataset_name=FLAGS.dataset_name,
+            dataset_config_name=FLAGS.dataset_config_name,
+            tokenizer_name=FLAGS.tokenizer_name,
+            cache_dir=FLAGS.dataset_path,
+            max_length=seq_length,
+            add_eos=True,
+            batch_size=global_batch_size,
+            batch_size_eval=global_batch_size,
+            loader_workers=FLAGS.loader_workers,
+            shuffle=True,
+            fault_tolerant=True,
+            drop_last=True,
+            generate_repetitive_data=FLAGS.generate_repetitive_data,
+        )
+    
     data_module.prepare_data()
     data_module.setup()
     train_loader = data_module.train_dataloader()
@@ -387,7 +407,8 @@ def main(argv):
     checkpointer = StreamingCheckpointer(FLAGS.checkpointer, ckpt_dir, enable=master_process)
 
     # Create model and optimizer
-    model = CausalLM(model_config, dtype=get_float_dtype_by_name(FLAGS.dtype))
+    model_dtype = get_float_dtype_by_name(FLAGS.dtype)
+    model = CausalLM(model_config, dtype=model_dtype, param_dtype=model_dtype)
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(
         FLAGS.optimizer, get_weight_decay_mask(model_config.get_weight_decay_exclusions())
     )
@@ -436,7 +457,7 @@ def main(argv):
             val_loader = data_module.val_dataloader()
             eval_metric_list = []
             
-            # Calculate and log Efficiency Metric
+            # Calculate and log Efficiency Metric (Pareto Frontier)
             total_layers = model_config.num_hidden_layers
             frozen_count = len(model_config.frozen_layers) if model_config.frozen_layers else 0
             active_layer_fraction = (total_layers - frozen_count) / total_layers
@@ -444,8 +465,18 @@ def main(argv):
                  wandb.log({"efficiency/active_layer_fraction": active_layer_fraction}, step=0)
 
             step = 0
+            
+            # Track throughput
+            total_tokens_processed = 0
+            start_time = time.time()
+            
             for eval_batch in tqdm(val_loader, disable=not master_process):
                 step += 1
+                
+                # Get batch size in tokens
+                current_batch_tokens = eval_batch["input_tokens"].shape[0] * eval_batch["input_tokens"].shape[1]
+                total_tokens_processed += current_batch_tokens
+
                 for k in eval_batch.keys():
                     eval_batch[k] = eval_batch[k].numpy()
                 sharded_rng, eval_metrics, ttt_stats = sharded_eval_step(train_state, sharded_rng, eval_batch)
@@ -458,40 +489,55 @@ def main(argv):
                     and model_config.seq_modeling_block != "self_attention"
                 )
                 if master_process and output_ttt_stats:
-                    all_layer_grad_norms = []
+                    all_layer_stats = []
+                    
                     for layer in range(len(ttt_stats)):
                         ttt_stats_layer = process_allgather(ttt_stats[layer])
-                        n_mini_batch = len(ttt_stats_layer[0])
-                        x_axis = [model_config.mini_batch_size * i for i in range(1, n_mini_batch + 1)]
-                        # log_ttt_stats(layer, ttt_stats_layer, x_axis, step)
                         
-                        # Collect Grad Norms for Heatmap
-                        grad_norm_t = jax.device_get(ttt_stats_layer[4])
+                        # Extract components
+                        ssl_tgt_mse = jax.device_get(ttt_stats_layer[0]).mean(axis=-1) # Mean over heads? Check shape.
+                        # Actually ttt_stats_layer components are likely (B, Time, ...) or similar.
+                        # Based on ttt_layer.py: 
+                        # ssl_tgt_last_in_mini_batch_from_mean_mse: (n_mini_batch,) after mean(axis=(0,2,3))
+                        # ttt_loss_mse_init: (n_mini_batch,)
+                        # ttt_loss_mse_step_0: (n_mini_batch,)
+                        # ttt_loss_mse_step_1: (n_mini_batch,)
+                        # grad_norm_t: (n_mini_batch,)
                         
-                        ttt_loss_mse_init = jax.device_get(ttt_stats_layer[1])
-                        ttt_loss_mse_step_1 = jax.device_get(ttt_stats_layer[3])
+                        # So they are 1D arrays over time (mini_batches).
+                        # But process_allgather might add a leading dimension for devices if not careful, 
+                        # but usually inside pjit it handles it. 
+                        # Wait, in ttt_layer.py, if output_ttt_stats is True, they are already reduced to (n_mini_batch,).
+                        # Let's assume they are simple arrays.
                         
-                        wandb.log({
-                            f"layers/layer_{layer}/grad_norm_mean": grad_norm_t.mean(),
-                            f"layers/layer_{layer}/loss_init_mean": ttt_loss_mse_init.mean(),
-                            f"layers/layer_{layer}/loss_final_mean": ttt_loss_mse_step_1.mean(),
-                        }, step=step)
+                        ssl_mse = jax.device_get(ttt_stats_layer[0])
+                        loss_init = jax.device_get(ttt_stats_layer[1])
+                        loss_step0 = jax.device_get(ttt_stats_layer[2])
+                        loss_step1 = jax.device_get(ttt_stats_layer[3])
+                        grad_norm = jax.device_get(ttt_stats_layer[4])
 
-                        # Average over mini-batch dimension (Time)
-                        grad_norm_t = grad_norm_t.mean(axis=-1)
-                        all_layer_grad_norms.append(grad_norm_t)
+                        all_layer_stats.append((ssl_mse, loss_init, loss_step0, loss_step1, grad_norm))
 
-                    if len(all_layer_grad_norms) > 0:
-                        log_gradient_norm_heatmap(all_layer_grad_norms, x_axis, step)
+                    n_mini_batch = len(all_layer_stats[0][0])
+                    x_axis = [model_config.mini_batch_size * i for i in range(1, n_mini_batch + 1)]
+                    
+                    # Log comprehensive stats (Heatmap + Table)
+                    log_comprehensive_stats(all_layer_stats, x_axis, step)
 
+            end_time = time.time()
+            duration = end_time - start_time
+            tokens_per_second = total_tokens_processed / duration
+            
             val_loss_avg = average_metrics(process_allgather(eval_metric_list))["eval_loss"].item()
             if master_process:
                 wandb.log({
                     "eval/loss": val_loss_avg,
                     "summary/final_eval_loss": val_loss_avg,
-                    "summary/active_layer_fraction": active_layer_fraction
+                    "summary/active_layer_fraction": active_layer_fraction,
+                    "eval/tokens_per_second": tokens_per_second
                 })
             master_print(f"Eval Loss: {val_loss_avg:.4f}")
+            master_print(f"Throughput: {tokens_per_second:.2f} tokens/sec")
             exit(0)
 
         train_loader_iterator = iter(train_loader)
@@ -546,41 +592,29 @@ def main(argv):
                 wandb.log(
                     {
                         "performance/train_loss": loss.item(),
-                        "performance/perplexity": jnp.exp(loss.item()),
                         "gradients/global_norm": grads_norm.item(),
                         "performance/learning_rate": learning_rate.item(),
-                        "Train Loss": loss.item(), # Keep original for compatibility
-                        "Gradient Norm": grads_norm.item(),
-                        "Learning Rate": learning_rate.item(),
                     },
                     step=step,
                 )
 
                 if output_ttt_stats:
-                    all_layer_grad_norms = []
+                    all_layer_stats = []
                     for layer in range(len(ttt_stats)):
                         ttt_stats_layer = process_allgather(ttt_stats[layer])
-                        n_mini_batch = len(ttt_stats_layer[0])
-                        x_axis = [model_config.mini_batch_size * i for i in range(1, n_mini_batch + 1)]
-                        # log_ttt_stats(layer, ttt_stats_layer, x_axis, step)
                         
-                        # Collect Grad Norms for Heatmap
-                        grad_norm_t = jax.device_get(ttt_stats_layer[4])
-                        
-                        ttt_loss_mse_init = jax.device_get(ttt_stats_layer[1])
-                        ttt_loss_mse_step_1 = jax.device_get(ttt_stats_layer[3])
-                        
-                        wandb.log({
-                            f"layers/layer_{layer}/grad_norm_mean": grad_norm_t.mean(),
-                            f"layers/layer_{layer}/loss_init_mean": ttt_loss_mse_init.mean(),
-                            f"layers/layer_{layer}/loss_final_mean": ttt_loss_mse_step_1.mean(),
-                        }, step=step)
+                        ssl_mse = jax.device_get(ttt_stats_layer[0])
+                        loss_init = jax.device_get(ttt_stats_layer[1])
+                        loss_step0 = jax.device_get(ttt_stats_layer[2])
+                        loss_step1 = jax.device_get(ttt_stats_layer[3])
+                        grad_norm = jax.device_get(ttt_stats_layer[4])
 
-                        grad_norm_t = grad_norm_t.mean(axis=-1)
-                        all_layer_grad_norms.append(grad_norm_t)
+                        all_layer_stats.append((ssl_mse, loss_init, loss_step0, loss_step1, grad_norm))
                     
-                    if len(all_layer_grad_norms) > 0:
-                        log_gradient_norm_heatmap(all_layer_grad_norms, x_axis, step)
+                    n_mini_batch = len(all_layer_stats[0][0])
+                    x_axis = [model_config.mini_batch_size * i for i in range(1, n_mini_batch + 1)]
+                    
+                    log_comprehensive_stats(all_layer_stats, x_axis, step)
 
             if (FLAGS.save_checkpoint_freq > 0 and step % FLAGS.save_checkpoint_freq == 0) or (
                 step == FLAGS.total_steps

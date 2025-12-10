@@ -440,29 +440,62 @@ def log_ttt_stats(layer, ttt_stats_layer, x_axis, step):
     plt.close()
 
 
-def log_gradient_norm_heatmap(grad_norms_all_layers, x_axis, step):
+def log_comprehensive_stats(all_layer_stats, x_axis, step):
     """
-    Logs gradient norms as a WandB Table.
-    grad_norms_all_layers: List of arrays, where each array is the grad norm for a layer.
-                           Shape of each array: (n_mini_batch,)
+    Logs comprehensive statistics for TTT layers to WandB, enabling
+    custom visualizations for drift, pareto frontiers, and layer comparisons.
+    
+    all_layer_stats: List of tuples, where each tuple is the stats for one layer.
+                     Tuple format: (ssl_mse, loss_init, loss_step0, loss_step1, grad_norm)
+                     Each element is a 1D array of shape (n_mini_batch,)
+    x_axis: List/Array of time steps (position in sequence).
+    step: Current training/eval step.
     """
-    # Create data for WandB Table
-    # Columns: Layer, Time, Gradient Norm
+    
+    # 1. Prepare Data for Heatmap & Table
+    grad_norms_matrix = []
     table_data = []
     
-    for layer_idx, layer_grads in enumerate(grad_norms_all_layers):
-        # layer_grads is 1D array of shape (n_mini_batch,)
-        for t_idx, grad_norm in enumerate(layer_grads):
-            time_step = x_axis[t_idx]
-            # Convert to standard python types for JSON serialization
-            table_data.append([
-                layer_idx, 
-                time_step, 
-                float(grad_norm)
-            ])
-            
-    # Create the Table
-    table = wandb.Table(columns=["Layer", "Time", "Gradient Norm"], data=table_data)
+    # Columns for the comprehensive raw data table
+    columns = ["Layer", "Time", "SSL_MSE", "Loss_Init", "Loss_Step0", "Loss_Step1", "Grad_Norm"]
     
-    # Log the Table (raw data)
-    wandb.log({"gradients/grad_norm_table": table}, step=step)
+    for layer_idx, stats in enumerate(all_layer_stats):
+        # Unpack stats
+        ssl_mse, loss_init, loss_step0, loss_step1, grad_norm = stats
+        
+        # Collect for Heatmap (Layer x Time)
+        grad_norms_matrix.append(grad_norm)
+        
+        # Collect for Table (Long format)
+        for t_idx, time_step in enumerate(x_axis):
+            table_data.append([
+                layer_idx + 1,        # 1-indexed layer
+                time_step,
+                float(ssl_mse[t_idx]),
+                float(loss_init[t_idx]),
+                float(loss_step0[t_idx]),
+                float(loss_step1[t_idx]),
+                float(grad_norm[t_idx])
+            ])
+
+    # 2. Log Heatmap (Figure 4: Where the model wants to learn)
+    # Convert list of arrays to 2D numpy array: (n_layers, n_timesteps)
+    grad_norms_matrix = np.array(grad_norms_matrix)
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    im = ax.imshow(grad_norms_matrix, aspect='auto', interpolation='nearest', cmap='viridis')
+    ax.set_title("Gradient Norm Heatmap (Plasticity)")
+    ax.set_ylabel("Layer Index")
+    ax.set_xlabel("Time (Mini-batch Index)")
+    plt.colorbar(im, label="Gradient Norm")
+    
+    log_plot(fig, "gradients/heatmap", step)
+    plt.close()
+
+    # 3. Log Raw Data Table (Enables Figure 2 & 5 in WandB UI)
+    # This single table allows plotting:
+    # - Fig 2 (Drift): Loss_Step1 vs Time (filter by Layer)
+    # - Fig 5 (Ablation): Grad_Norm vs Time (compare Layer 2 vs 22)
+    table = wandb.Table(columns=columns, data=table_data)
+    wandb.log({"stats/comprehensive_table": table}, step=step)
+
