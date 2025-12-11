@@ -4,6 +4,7 @@ import os.path as osp
 import time
 import pickle
 import numpy as np
+import uuid
 from tqdm import tqdm
 from copy import deepcopy
 
@@ -14,7 +15,11 @@ from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as PS
 from jax.experimental.multihost_utils import process_allgather
 import flax
+import optax
 from flax.training.train_state import TrainState
+
+from transformers import AutoTokenizer
+from datasets import load_dataset
 
 from ttt.dataloader.language_modeling_hf import LMDataModule
 
@@ -58,6 +63,13 @@ def get_syntax_ids(tokenizer):
     return syntax_ids
 
 class SyntheticDataModule(LMDataModule):
+    def __init__(self, max_steps, **kwargs):
+        super().__init__(**kwargs)
+        self.max_steps = max_steps
+
+    def prepare_data(self):
+        pass
+
     def process_dataset(self):
         tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, use_fast=True)
         master_print("Generating Synthetic 'Needle in Haystack' data...")
@@ -65,7 +77,7 @@ class SyntheticDataModule(LMDataModule):
         all_token_ids = []
         # Generate enough data for max_steps * global_batch_size
         # We estimate needed sequences. A bit more to be safe.
-        num_sequences = 200 # Arbitrary buffer
+        num_sequences = self.max_steps * self.batch_size + 4 # Arbitrary buffer
         
         for _ in range(num_sequences):
             # 1. Generate Needle
@@ -114,11 +126,15 @@ class SyntheticDataModule(LMDataModule):
         }, tokenizer
 
 class PG19DataModule(LMDataModule):
+    def prepare_data(self):
+        # Override to prevent base class from downloading full dataset
+        pass
+
     def process_dataset(self):
         tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, use_fast=True)
         master_print(f"Streaming PG-19 (first 5 books)...")
         
-        dataset = load_dataset("pg19", split="test", streaming=True, trust_remote_code=True)
+        dataset = load_dataset("emozilla/pg19", split="test", streaming=True)
         subset = list(dataset.take(5))
         
         all_token_ids = []
@@ -181,7 +197,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     jax_distributed=JaxDistributedConfig.get_default_config(),
     load_model_config="",
     update_model_config="",
-    max_steps=100, # Limit number of steps to analyze
+    max_steps=10, # Limit number of steps to analyze
     dataset_split="validation", # or "test"
     output_filename="analysis_stats.pkl",
 )
@@ -222,6 +238,7 @@ def main(argv):
     # Data Module
     if FLAGS.dataset_type == "synthetic":
         data_module = SyntheticDataModule(
+            max_steps=FLAGS.max_steps,
             dataset_name="synthetic",
             dataset_config_name=None,
             tokenizer_name=FLAGS.tokenizer_name,
@@ -237,7 +254,7 @@ def main(argv):
         )
     elif FLAGS.dataset_type == "pg19":
         data_module = PG19DataModule(
-            dataset_name="pg19",
+            dataset_name="deepmind/pg19",
             dataset_config_name=None,
             tokenizer_name=FLAGS.tokenizer_name,
             cache_dir=None,
@@ -322,7 +339,8 @@ def main(argv):
             attention_mask=jnp.ones((4, FLAGS.seq_length), dtype=jnp.int32),
             rngs=rng_generator(model_config.rng_keys()),
         )
-        return TrainState.create(params=params, tx=None, apply_fn=None) # No optimizer
+        # Manually create TrainState with no optimizer
+        return TrainState(step=0, params=params, tx=None, opt_state=None, apply_fn=None)
 
     # Checkpointer
     checkpointer = StreamingCheckpointer(StreamingCheckpointer.get_default_config(), FLAGS.load_checkpoint, enable=master_process)
@@ -357,7 +375,7 @@ def main(argv):
         # If the user passed the full string "trainstate::...", we handle it.
         load_path = FLAGS.load_checkpoint
         if "::" not in load_path:
-            load_path = f"trainstate::{load_path}"
+            load_path = f"trainstate_params::{load_path}"
             
         train_state, restored_params = checkpointer.load_trainstate_checkpoint(
             load_path, train_state_shapes, shard_fns
@@ -367,7 +385,8 @@ def main(argv):
              # Create TrainState from params
              # We need a pjit function to create TrainState from params
              def create_train_state(params):
-                 return TrainState.create(params=params, tx=None, apply_fn=None)
+                 # Manually create TrainState with no optimizer
+                 return TrainState(step=0, params=params, tx=None, opt_state=None, apply_fn=None)
                  
              sharded_create = pjit(
                  create_train_state, 
@@ -453,7 +472,23 @@ def main(argv):
                     # Compute Metrics per Layer
                     for l, layer_stats in enumerate(ttt_stats_np):
                          if len(layer_stats) > 4:
-                             grad_norm = step_metrics["raw_grads"][l][b] # [L]
+                             # grad_norm shape is (batch_size, n_mini_batch, mini_batch_size) = (B, 128, 16)
+                             # We flatten it to (B, 2048) and then pick [b]
+                             
+                             grad_norm_raw = step_metrics["raw_grads"][l]
+                             # Flatten axis 1 and 2: (B, 128, 16) -> (B, 2048)
+                             grad_norm_batch = grad_norm_raw.reshape(batch_size, -1)
+                             
+                             grad_norm = grad_norm_batch[b]
+                             
+                             # Ensure length matches
+                             if len(grad_norm) != seq_len:
+                                 # Should not happen given the math, but safe check
+                                 if len(grad_norm) > seq_len:
+                                     grad_norm = grad_norm[:seq_len]
+                                 else:
+                                     pad = seq_len - len(grad_norm)
+                                     grad_norm = np.pad(grad_norm, (0, pad), 'edge')
                              
                              def safe_mean(arr, mask):
                                  if mask.sum() > 0:

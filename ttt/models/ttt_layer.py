@@ -331,7 +331,7 @@ class TTTBase(nn.Module):
             ttt_loss_mse_init = ttt_loss_mse_init.mean(axis=(0, 1))
             ttt_loss_mse_step_0 = ttt_loss_mse_step_0.mean(axis=(0, 1))
             ttt_loss_mse_step_1 = ttt_loss_mse_step_1.mean(axis=(0, 1))
-            grad_norm_t = grad_norm_t.mean(axis=(0, 1))
+            grad_norm_t = grad_norm_t.mean(axis=1)
 
         return Z, (ttt_loss_mse_init, ttt_loss_mse_step_0, ttt_loss_mse_step_1, grad_norm_t)
 
@@ -434,6 +434,10 @@ class TTTLinearBase(TTTBase):
 
         # ||Delta theta|| = eta * ||delta|| * sqrt(||x||^2 + 1)
         grad_norm_t = eta_mag * delta_norm * jnp.sqrt(jnp.square(x_norm) + 1.0)  # (B_mini,)
+
+        # Cast back to original dtype to match scan carry type
+        W1_bar_last = W1_bar_last.astype(W1_init.dtype)
+        b1_bar_last = b1_bar_last.astype(b1_init.dtype)
 
         ttt_params_mini_batch_new = (W1_bar_last, b1_bar_last)
 
@@ -625,6 +629,12 @@ class TTTMLPBase(TTTBase):
 
         # Total
         grad_norm_t = jnp.sqrt(jnp.square(grad_norm_1) + jnp.square(grad_norm_2)) # (B_mini,)
+
+        # Cast back to original dtype to match scan carry type
+        W1_bar_last = W1_bar_last.astype(W1_init.dtype)
+        W2_bar_last = W2_bar_last.astype(W2_init.dtype)
+        b1_bar_last = b1_bar_last.astype(b1_init.dtype)
+        b2_bar_last = b2_bar_last.astype(b2_init.dtype)
 
         ttt_params_mini_batch_new = (W1_bar_last, W2_bar_last, b1_bar_last, b2_bar_last)
 
