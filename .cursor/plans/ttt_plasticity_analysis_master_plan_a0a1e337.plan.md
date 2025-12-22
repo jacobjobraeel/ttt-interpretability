@@ -56,7 +56,3 @@ This master plan outlines the strategy to create a dedicated analysis pipeline f
 **Goal:** Determine if Wikitext (2k seq len) is sufficient or if synthetic data is needed.
 
 1.  **Synthetic Data Probe**:
-
-    -   Add a `--dataset=synthetic` flag to `run_inference.py`.
-    -   Implement a simple "Needle in a Haystack" generator (random key-value pairs repeated after distance $D$).
-    -   **Comparison:** Run the "Plasticity Heatmap" on Wikitext vs. Synthetic.
