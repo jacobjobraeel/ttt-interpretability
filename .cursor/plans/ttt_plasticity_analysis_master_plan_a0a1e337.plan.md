@@ -60,4 +60,3 @@ This master plan outlines the strategy to create a dedicated analysis pipeline f
     -   Add a `--dataset=synthetic` flag to `run_inference.py`.
     -   Implement a simple "Needle in a Haystack" generator (random key-value pairs repeated after distance $D$).
     -   **Comparison:** Run the "Plasticity Heatmap" on Wikitext vs. Synthetic.
-    -   *Decision Logic:* If the Synthetic heatmap shows clear, interpretable bands (updates happen *exactly* at the retrieval trigger) while Wikitext is noisy, we shift focus to Synthetic data for the "Why" explanation.
