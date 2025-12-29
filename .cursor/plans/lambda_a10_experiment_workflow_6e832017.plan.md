@@ -112,5 +112,3 @@ ls experiments/
 ## Quick Reference: Experiment Summary
 
 | Script | Experiment Name | Frozen Layers | Steps | Data Type ||--------|----------------|---------------|-------|-----------|| `1.3b_wikitext.sh` | 1.3b-wikitext-baseline | None | 20 | Wikitext || `1.3b_cortex.sh` | 1.3b-cortex | 0-4 | 20 | Wikitext || `1.3b_retina.sh` | 1.3b-retina | 20-23 | 20 | Wikitext || `1.3b_drift_uniform.sh` | 1.3b-drift-uniform | None | 50 | Repetitive || `1.3b_drift_retina.sh` | 1.3b-drift-retina | 20-23 | 50 | Repetitive |
-
-## Notes
